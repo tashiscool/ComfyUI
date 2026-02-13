@@ -240,6 +240,17 @@ if comfy.options.args_parsing:
 else:
     args = parser.parse_args([])
 
+# MPS defaults: --highvram --preview-method auto --cache-lru 3
+# Only apply when not explicitly overridden on the command line.
+import torch
+if torch.backends.mps.is_available():
+    if not args.highvram and not args.gpu_only and not args.lowvram and not args.novram:
+        args.highvram = True
+    if args.preview_method == LatentPreviewMethod.NoPreviews:
+        args.preview_method = LatentPreviewMethod.Auto
+    if args.cache_lru == 0 and not args.cache_classic and not args.cache_none and args.cache_ram == 0:
+        args.cache_lru = 3
+
 if args.windows_standalone_build:
     args.auto_launch = True
 
