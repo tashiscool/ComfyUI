@@ -116,7 +116,9 @@ def _patch_memory_reporting():
     # get_free_memory() stays too small after Patch D and we never have "enough" free.
     # Use ~0.95 of recommended_max so we report a usable budget (e.g. 35–37 GB on
     # 48 GB Mac); Patch D unloads CPU models, then we have room for 14B + activations.
-    effective_max = int(recommended_max * 0.95)
+    # Testing 44 GB: keeps models loaded, avoids unnecessary unload/reload cycles.
+    # OS + Python need ~4 GB headroom. MPS GC active (watermark ratio 1.7).
+    effective_max = int(44 * (1024**3))  # was: int(recommended_max * 0.95)
 
     # Verify phys_footprint works at startup
     test_footprint = _get_phys_footprint()
@@ -415,6 +417,44 @@ def _patch_unified_memory_unloading():
     return 1
 
 
+def _auto_enable_metal_flash_attention():
+    """Auto-enable Metal Flash Attention when a suitable backend is available.
+
+    Uses the attention module's probe results to avoid re-checking.
+    The probe in attention.py already tested mps-flash-attn (subprocess test)
+    and custom Metal FA, setting MPS_FLASH_ATTENTION_IS_AVAILABLE accordingly.
+    """
+    try:
+        from comfy.cli_args import args
+        # Don't override if user explicitly chose another attention method
+        if any([args.use_split_cross_attention, args.use_quad_cross_attention,
+                args.use_pytorch_cross_attention, args.use_sage_attention,
+                args.use_flash_attention, args.use_metal_flash_attention]):
+            return 0
+
+        import comfy.ldm.modules.attention as attn_mod
+        if not attn_mod.MPS_FLASH_ATTENTION_IS_AVAILABLE:
+            return 0
+
+        args.use_metal_flash_attention = True
+
+        if attn_mod._MFA_PACKAGE_AVAILABLE:
+            backend = f"mps-flash-attn {attn_mod._mfa.__version__}"
+        else:
+            backend = "custom Metal FA kernel"
+        log.info("[MPS] Metal Flash Attention auto-enabled (%s) — sub-quad for short, Metal FA for long", backend)
+
+        # If selection cascade already ran, update optimized_attention directly.
+        if hasattr(attn_mod, 'attention_metal_flash'):
+            attn_mod.optimized_attention = attn_mod.attention_metal_flash
+            attn_mod.optimized_attention_masked = attn_mod.attention_metal_flash
+            log.info("[MPS] Updated attention backend to Metal Flash Attention")
+        return 1
+    except (ImportError, AttributeError):
+        pass
+    return 0
+
+
 def apply_patches():
     """Apply all MPS compatibility patches. Only activates on MPS devices.
 
@@ -434,6 +474,7 @@ def apply_patches():
     total_patches += _patch_torch_compile()
     total_patches += _patch_model_unload()
     total_patches += _patch_unified_memory_unloading()
+    total_patches += _auto_enable_metal_flash_attention()
 
     _patches_applied = True
     log.info("[MPS] Applied {} patches".format(total_patches))

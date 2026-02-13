@@ -727,7 +727,8 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             requested_gb = mem * 1.1 / (1024**3) + extra_mem / (1024**3)
             logging.info(f"[MPS DIAG] total_memory_required[{dev}]={mem/(1024**3):.2f}GB "
                          f"*1.1+extra={requested_gb:.2f}GB")
-        # Warn when requested free amount exceeds unified memory budget (thrashing cause)
+        # Warn when requested free amount exceeds unified memory budget (thrashing cause),
+        # and on extreme cases fail fast instead of letting a doomed run thrash for hours.
         for device in total_memory_required:
             if device != torch.device("cpu") and hasattr(device, 'type') and device.type == 'mps':
                 total_budget = get_total_memory(device)
@@ -740,6 +741,17 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
                         "still run and cause heavy swap.",
                         requested / (1024**3), total_budget / (1024**3)
                     )
+                    # If the activation estimate is many times larger than the MPS budget, this run
+                    # is effectively doomed on this machine (would require many hours of thrashing
+                    # unified memory). Fail fast with a clear error instead of hanging.
+                    doom_ratio = requested / max(total_budget, 1)
+                    if doom_ratio > 3.0:
+                        raise RuntimeError(
+                            "[MPS] Activation estimate %.1f GB exceeds safe MPS budget %.1f GB by a factor of %.1f. "
+                            "This workflow is too large for this Apple Silicon unified-memory configuration. "
+                            "Reduce resolution, frame count, or the number of passes, or use a smaller/quantized model."
+                            % (requested / (1024**3), total_budget / (1024**3), doom_ratio)
+                        )
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
@@ -1413,6 +1425,11 @@ def sage_attention_enabled():
 
 def flash_attention_enabled():
     return args.use_flash_attention
+
+def metal_flash_attention_enabled():
+    if cpu_state != CPUState.MPS:
+        return False
+    return args.use_metal_flash_attention
 
 def xformers_enabled():
     global directml_enabled

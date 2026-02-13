@@ -46,6 +46,39 @@ except ImportError:
         logging.error(f"\n\nTo use the `--use-flash-attention` feature, the `flash-attn` package must be installed first.\ncommand:\n\t{sys.executable} -m pip install flash-attn")
         exit(-1)
 
+MPS_FLASH_ATTENTION_IS_AVAILABLE = False
+_MFA_PACKAGE_AVAILABLE = False
+_mfa = None
+try:
+    import mps_flash_attn as _mfa_mod
+    if _mfa_mod.is_available():
+        # mps-flash-attn can report available but crash on macOS 26 (MetalASM pipeline
+        # creation failure). Probe in subprocess to avoid killing the main process.
+        import subprocess
+        _probe = subprocess.run(
+            [sys.executable, '-c',
+             'import mps_flash_attn,torch;'
+             'q=k=v=torch.randn(1,1,64,64,device="mps",dtype=torch.float16);'
+             'mps_flash_attn.flash_attention(q,k,v);torch.mps.synchronize()'],
+            capture_output=True, timeout=60)
+        if _probe.returncode == 0:
+            _mfa = _mfa_mod
+            _MFA_PACKAGE_AVAILABLE = True
+            logging.info("mps-flash-attn %s probe passed", _mfa.__version__)
+        else:
+            logging.warning("mps-flash-attn probe failed (exit %d), disabled", _probe.returncode)
+except (ImportError, subprocess.TimeoutExpired):
+    pass
+
+if not _MFA_PACKAGE_AVAILABLE:
+    try:
+        from comfy.ldm.modules.metal_attention import METAL_FLASH_ATTENTION_AVAILABLE
+        MPS_FLASH_ATTENTION_IS_AVAILABLE = METAL_FLASH_ATTENTION_AVAILABLE
+    except ImportError:
+        pass
+else:
+    MPS_FLASH_ATTENTION_IS_AVAILABLE = True
+
 REGISTERED_ATTENTION_FUNCTIONS = {}
 def register_attention_function(name: str, func: Callable):
     # avoid replacing existing functions
@@ -243,6 +276,10 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
     kv_chunk_size_min = None
     kv_chunk_size = None
     query_chunk_size = None
+    # On MPS with large sequences, default sqrt(k_tokens) gives very small kv chunks
+    # and many kernel launches (7–19x slower than theoretical). Use larger minimum.
+    if query.device.type == 'mps' and k_tokens > 100000:
+        kv_chunk_size_min = 1024
 
     for x in [4096, 2048, 1024, 512, 256]:
         count = mem_free_total / (batch_x_heads * bytes_per_token * x * 4.0)
@@ -253,6 +290,24 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
 
     if query_chunk_size is None:
         query_chunk_size = 512
+        # When no candidate fits full KV, compute the largest kv_chunk that fits
+        # in available memory instead of falling back to sqrt(N) which is far too
+        # small for large sequences (e.g. 302K tokens → sqrt = 550 → 325K iters
+        # vs optimal ~150K chunk → ~1.2K iters = 270x faster).
+        # Peak memory per chunk: batch_x_heads × query_chunk × kv_chunk × attn_elem_size
+        attn_elem_size = 4  # attention weights are float32 (upcast or native)
+        # Use 70% of free memory to leave room for intermediates (softmax, bmm output)
+        usable_mem = mem_free_total * 0.7
+        mem_per_kv_token = batch_x_heads * query_chunk_size * attn_elem_size
+        if mem_per_kv_token > 0:
+            optimal_kv = int(usable_mem / mem_per_kv_token)
+            # On MPS, cap attention chunk to 2 GB. The reported free memory doesn't
+            # account for MPS graph caching and other overhead, so large chunks cause
+            # swap thrashing. 2 GB gives ~24K KV tokens per chunk at 40 heads × 512 qc.
+            if query.device.type == 'mps':
+                max_kv_for_2gb = int(2 * 1024**3 / (batch_x_heads * query_chunk_size * attn_elem_size))
+                optimal_kv = min(optimal_kv, max_kv_for_2gb)
+            kv_chunk_size = min(max(optimal_kv, 256), k_tokens)
 
     if mask is not None:
         if len(mask.shape) == 2:
@@ -328,6 +383,9 @@ def attention_split(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
         steps = 2**(math.ceil(math.log(mem_required / mem_free_total, 2)))
         # print(f"Expected tensor size:{tensor_size/gb:0.1f}GB, cuda free:{mem_free_cuda/gb:0.1f}GB "
         #      f"torch free:{mem_free_torch/gb:0.1f} total:{mem_free_total/gb:0.1f} steps:{steps}")
+    # On MPS, avoid over-slicing (same rationale as diffusionmodules slice_attention).
+    if steps > 16 and q.device.type == 'mps':
+        steps = 16
 
     if steps > 64:
         max_res = math.floor(math.sqrt(math.sqrt(mem_free_total / 2.5)) / 8) * 64
@@ -718,9 +776,92 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     return out
 
 
+@wrap_attn
+def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    """Smart MPS attention: sub-quad for short, Metal FA for long sequences.
+
+    Short sequences (Pony/Illustrious/SDXL, <=32K tokens):
+      → Sub-quadratic attention: uses Apple's optimized FP16 bmm (~6 TFLOPS).
+        Faster than SDPA which force-upcasts to FP32 on macOS 14.5+.
+
+    Long sequences (Wan 2.2, >32K tokens):
+      → Metal Flash Attention (O(N) memory): prevents swap thrashing and OOM.
+        Prefers mps-flash-attn package if available, falls back to custom kernel.
+    """
+    if not MPS_FLASH_ATTENTION_IS_AVAILABLE:
+        return attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                  skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    # Determine sequence length to pick the right backend
+    n_kv = k.shape[2] if skip_reshape else k.shape[1]
+
+    # Short sequences: sub-quad is fastest on MPS (FP16 bmm beats FP32 SDPA)
+    if n_kv <= 32768:
+        return attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                  skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    # Long sequences: need O(N) memory flash attention
+    if skip_reshape:
+        b, _, _, dim_head = q.shape
+    else:
+        b, _, dim_head = q.shape
+        dim_head //= heads
+
+    # Try mps-flash-attn package first (battle-tested Metal kernels)
+    if _MFA_PACKAGE_AVAILABLE:
+        try:
+            if skip_reshape:
+                q_4d, k_4d, v_4d = q, k, v
+            else:
+                q_4d = q.view(b, -1, heads, dim_head).transpose(1, 2)
+                k_4d = k.view(b, -1, heads, dim_head).transpose(1, 2)
+                v_4d = v.view(b, -1, heads, dim_head).transpose(1, 2)
+
+            q_4d = q_4d.contiguous()
+            k_4d = k_4d.contiguous()
+            v_4d = v_4d.contiguous()
+
+            # Convert bool mask for mps_flash_attn (True=masked, opposite of ComfyUI)
+            attn_mask = None
+            if mask is not None and mask.dtype == torch.bool:
+                attn_mask = ~mask
+                if attn_mask.ndim == 2:
+                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+                elif attn_mask.ndim == 3:
+                    attn_mask = attn_mask.unsqueeze(1)
+
+            if n_kv > 65536:
+                out = _mfa.flash_attention_chunked(q_4d, k_4d, v_4d, chunk_size=16384)
+            else:
+                out = _mfa.flash_attention(q_4d, k_4d, v_4d, attn_mask=attn_mask)
+
+            if skip_output_reshape:
+                return out
+            else:
+                return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+        except Exception as e:
+            logging.warning("mps_flash_attn failed (%s), trying custom Metal FA", e)
+
+    # Fall back to custom Metal FA kernel (simdgroup_matrix, works on macOS 26)
+    try:
+        from comfy.ldm.modules.metal_attention import metal_flash_attention
+        return metal_flash_attention(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                     skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+    except Exception as e:
+        logging.warning("Custom Metal FA failed (%s), falling back to sub_quad", e)
+        return attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                  skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+
 optimized_attention = attention_basic
 
-if model_management.sage_attention_enabled():
+if model_management.metal_flash_attention_enabled():
+    if _MFA_PACKAGE_AVAILABLE:
+        logging.info("Using Metal Flash Attention (sub-quad for <=32K, mps-flash-attn for >32K)")
+    else:
+        logging.info("Using Metal Flash Attention (sub-quad for <=32K, custom Metal FA for >32K)")
+    optimized_attention = attention_metal_flash
+elif model_management.sage_attention_enabled():
     logging.info("Using sage attention")
     optimized_attention = attention_sage
 elif model_management.xformers_enabled():
@@ -744,6 +885,8 @@ optimized_attention_masked = optimized_attention
 
 
 # register core-supported attention functions
+if MPS_FLASH_ATTENTION_IS_AVAILABLE:
+    register_attention_function("metal_flash", attention_metal_flash)
 if SAGE_ATTENTION_IS_AVAILABLE:
     register_attention_function("sage", attention_sage)
 if SAGE_ATTENTION3_IS_AVAILABLE:

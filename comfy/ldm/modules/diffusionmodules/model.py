@@ -256,6 +256,10 @@ def slice_attention(q, k, v):
 
     if mem_required > mem_free_total and mem_free_total > 0:
         steps = 2**(math.ceil(math.log(mem_required / mem_free_total, 2)))
+    # On MPS, avoid over-slicing: small reported free memory leads to huge step counts
+    # and many tiny chunks (7–19x slower). Cap initial steps; OOM retry will increase.
+    if steps > 16 and q.device.type == 'mps':
+        steps = 16
 
     while True:
         try:
