@@ -1,5 +1,8 @@
 import math
+import os
 import sys
+import glob
+import importlib
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +11,8 @@ from einops import rearrange, repeat
 from typing import Optional, Any, Callable, Union
 import logging
 import functools
+
+logger = logging.getLogger(__name__)
 
 from .diffusionmodules.util import AlphaBlender, timestep_embedding
 from .sub_quadratic_attention import efficient_dot_product_attention
@@ -47,30 +52,125 @@ except ImportError:
         exit(-1)
 
 MPS_FLASH_ATTENTION_IS_AVAILABLE = False
+_MFA_NATIVE_BRIDGE_AVAILABLE = False
+_mfa_native = None
 _MFA_PACKAGE_AVAILABLE = False
 _mfa = None
-try:
-    import mps_flash_attn as _mfa_mod
-    if _mfa_mod.is_available():
-        # mps-flash-attn can report available but crash on macOS 26 (MetalASM pipeline
-        # creation failure). Probe in subprocess to avoid killing the main process.
-        import subprocess
-        _probe = subprocess.run(
-            [sys.executable, '-c',
-             'import mps_flash_attn,torch;'
-             'q=k=v=torch.randn(1,1,64,64,device="mps",dtype=torch.float16);'
-             'mps_flash_attn.flash_attention(q,k,v);torch.mps.synchronize()'],
-            capture_output=True, timeout=60)
-        if _probe.returncode == 0:
-            _mfa = _mfa_mod
-            _MFA_PACKAGE_AVAILABLE = True
-            logging.info("mps-flash-attn %s probe passed", _mfa.__version__)
-        else:
-            logging.warning("mps-flash-attn probe failed (exit %d), disabled", _probe.returncode)
-except (ImportError, subprocess.TimeoutExpired):
-    pass
 
-if not _MFA_PACKAGE_AVAILABLE:
+
+def _is_truthy_env(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _try_load_native_mfa_bridge():
+    """Load native MFABridge PyTorch extension (Swift/ObjC++/C++ path)."""
+    if not _is_truthy_env("COMFY_MPS_NATIVE_BRIDGE_ENABLED", True):
+        return None
+
+    def _validate_module(mod):
+        required = ("metal_scaled_dot_product_attention", "is_metal_available")
+        if not all(hasattr(mod, fn) for fn in required):
+            return False
+        try:
+            return bool(mod.is_metal_available())
+        except Exception:
+            return False
+
+    # 1) Normal import path (pip/install editable).
+    try:
+        mod = importlib.import_module("metal_sdpa_extension")
+        if _validate_module(mod):
+            return mod
+    except Exception:
+        pass
+
+    # 2) Optional explicit .so path.
+    explicit_so = os.environ.get("COMFY_MPS_NATIVE_BRIDGE_SO", "").strip()
+    if explicit_so:
+        so_dir = os.path.dirname(explicit_so)
+        so_name = os.path.splitext(os.path.basename(explicit_so))[0]
+        if so_dir and os.path.isdir(so_dir):
+            if so_dir not in sys.path:
+                sys.path.insert(0, so_dir)
+            try:
+                mod = importlib.import_module(so_name)
+                if _validate_module(mod):
+                    return mod
+            except Exception:
+                pass
+
+    # 3) Common local source tree build output.
+    search_roots = []
+    explicit_root = os.environ.get("COMFY_MPS_NATIVE_BRIDGE_ROOT", "").strip()
+    if explicit_root:
+        search_roots.append(explicit_root)
+    default_root = os.path.expanduser("~/qwen3-coder-next-mac/metal-flash-sdpa/examples/pytorch-custom-op-ffi")
+    if os.path.isdir(default_root):
+        search_roots.append(default_root)
+
+    for root in search_roots:
+        patterns = [
+            os.path.join(root, "build", "lib*", "metal_sdpa_extension*.so"),
+            os.path.join(root, "metal_sdpa_extension*.so"),
+        ]
+        for pattern in patterns:
+            for so_path in sorted(glob.glob(pattern)):
+                so_dir = os.path.dirname(so_path)
+                if so_dir not in sys.path:
+                    sys.path.insert(0, so_dir)
+                try:
+                    mod = importlib.import_module("metal_sdpa_extension")
+                    if _validate_module(mod):
+                        return mod
+                except Exception:
+                    continue
+
+    return None
+
+
+_mfa_native = _try_load_native_mfa_bridge()
+if _mfa_native is not None:
+    _MFA_NATIVE_BRIDGE_AVAILABLE = True
+    logger.info("Native MFABridge backend enabled (metal_sdpa_extension)")
+_MFA_NATIVE_BRIDGE_RUNTIME_ENABLED = _MFA_NATIVE_BRIDGE_AVAILABLE
+_MFA_NATIVE_BRIDGE_DISABLE_ON_ERROR = _is_truthy_env("COMFY_MPS_NATIVE_BRIDGE_DISABLE_ON_ERROR", True)
+
+_ALLOW_EXTERNAL_MPS_FLASH_ATTN = (
+    os.environ.get("COMFY_ALLOW_EXTERNAL_MPS_FLASH_ATTN", "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+if _ALLOW_EXTERNAL_MPS_FLASH_ATTN:
+    try:
+        import subprocess
+        import mps_flash_attn as _mfa_mod
+        if _mfa_mod.is_available():
+            # External package is opt-in only. Keep probe to avoid hard crashes
+            # from broken Metal pipelines on unsupported macOS / driver combos.
+            _probe = subprocess.run(
+                [sys.executable, '-c',
+                 'import mps_flash_attn,torch;'
+                 'q=k=v=torch.randn(1,1,64,64,device="mps",dtype=torch.float16);'
+                 'mps_flash_attn.flash_attention(q,k,v);torch.mps.synchronize()'],
+                capture_output=True, timeout=60)
+            if _probe.returncode == 0:
+                _mfa = _mfa_mod
+                _MFA_PACKAGE_AVAILABLE = True
+                logger.info("External mps-flash-attn %s enabled by env", _mfa.__version__)
+            else:
+                logger.warning("External mps-flash-attn probe failed (exit %d), disabled", _probe.returncode)
+    except (ImportError, subprocess.TimeoutExpired):
+        pass
+    except Exception as e:
+        logger.warning("External mps-flash-attn disabled: %s", e)
+else:
+    logger.info("External mps-flash-attn disabled by default; set COMFY_ALLOW_EXTERNAL_MPS_FLASH_ATTN=1 to opt in")
+
+if _MFA_NATIVE_BRIDGE_AVAILABLE:
+    MPS_FLASH_ATTENTION_IS_AVAILABLE = True
+elif not _MFA_PACKAGE_AVAILABLE:
     try:
         from comfy.ldm.modules.metal_attention import METAL_FLASH_ATTENTION_AVAILABLE
         MPS_FLASH_ATTENTION_IS_AVAILABLE = METAL_FLASH_ATTENTION_AVAILABLE
@@ -78,6 +178,61 @@ if not _MFA_PACKAGE_AVAILABLE:
         pass
 else:
     MPS_FLASH_ATTENTION_IS_AVAILABLE = True
+
+
+def _env_int(name, default, minimum=None):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except Exception:
+        return default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+def _env_bool(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Dispatch thresholds (industry-style knobs).
+_MPS_FA_BASE_THRESHOLD = _env_int("COMFY_MPS_FA_THRESHOLD", 32768, 1024)
+_MPS_FA_BASE_CHUNK_THRESHOLD = _env_int("COMFY_MPS_FA_CHUNK_THRESHOLD", 65536, 1024)
+_MPS_FA_CHUNK_SIZE = _env_int("COMFY_MPS_FA_CHUNK_SIZE", 16384, 1024)
+_MPS_FA_PRESSURE_ROUTING = _env_bool("COMFY_MPS_FA_PRESSURE_ROUTING", True)
+_MPS_FA_PRESSURE_THRESHOLD = _env_int("COMFY_MPS_FA_PRESSURE_THRESHOLD", 24576, 1024)
+_MPS_FA_PRESSURE_CHUNK_THRESHOLD = _env_int("COMFY_MPS_FA_PRESSURE_CHUNK_THRESHOLD", 32768, 1024)
+
+
+def _get_mps_pressure_state():
+    if not _MPS_FA_PRESSURE_ROUTING:
+        return {}
+    try:
+        import comfy.mps_compat as mps_compat
+        if hasattr(mps_compat, "get_mps_pressure_state"):
+            state = mps_compat.get_mps_pressure_state()
+            if isinstance(state, dict):
+                return state
+    except Exception:
+        pass
+    return {}
+
+
+def _get_mps_attention_policy():
+    """Return route thresholds tuned by runtime pressure state."""
+    fa_threshold = _MPS_FA_BASE_THRESHOLD
+    chunk_threshold = _MPS_FA_BASE_CHUNK_THRESHOLD
+    pressure = _get_mps_pressure_state()
+    if pressure.get("under_pressure", False):
+        fa_threshold = min(fa_threshold, _MPS_FA_PRESSURE_THRESHOLD)
+        chunk_threshold = min(chunk_threshold, _MPS_FA_PRESSURE_CHUNK_THRESHOLD)
+    return fa_threshold, chunk_threshold, pressure
+
 
 REGISTERED_ATTENTION_FUNCTIONS = {}
 def register_attention_function(name: str, func: Callable):
@@ -780,23 +935,42 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
 def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
     """Smart MPS attention: sub-quad for short, Metal FA for long sequences.
 
-    Short sequences (Pony/Illustrious/SDXL, <=32K tokens):
+    Short sequences (Pony/Illustrious/SDXL, default <=32K tokens):
       → Sub-quadratic attention: uses Apple's optimized FP16 bmm (~6 TFLOPS).
         Faster than SDPA which force-upcasts to FP32 on macOS 14.5+.
 
-    Long sequences (Wan 2.2, >32K tokens):
+    Long sequences (Wan 2.2, default >32K tokens):
       → Metal Flash Attention (O(N) memory): prevents swap thrashing and OOM.
         Prefers mps-flash-attn package if available, falls back to custom kernel.
+
+    Thresholds are tunable through COMFY_MPS_FA_THRESHOLD and pressure-aware policy.
     """
     if not MPS_FLASH_ATTENTION_IS_AVAILABLE:
+        logger.debug("[MPS ATTN] route=sub_quad reason=metal_flash_unavailable")
         return attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
                                   skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
 
     # Determine sequence length to pick the right backend
     n_kv = k.shape[2] if skip_reshape else k.shape[1]
+    fa_threshold, chunk_threshold, pressure = _get_mps_attention_policy()
+    under_pressure = bool(pressure.get("under_pressure", False))
+    if under_pressure:
+        logger.debug(
+            "[MPS ATTN] pressure-aware policy: tier=%s swap_delta=%.1f avail=%.1f "
+            "fa_threshold=%d chunk_threshold=%d",
+            pressure.get("tier", "unknown"),
+            float(pressure.get("swap_delta_gb", 0.0)),
+            float(pressure.get("available_gb", 0.0)),
+            fa_threshold,
+            chunk_threshold,
+        )
 
     # Short sequences: sub-quad is fastest on MPS (FP16 bmm beats FP32 SDPA)
-    if n_kv <= 32768:
+    if n_kv <= fa_threshold:
+        logger.debug(
+            "[MPS ATTN] route=sub_quad reason=short_sequence n_kv=%d threshold=%d pressure=%s",
+            n_kv, fa_threshold, under_pressure,
+        )
         return attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
                                   skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
 
@@ -807,8 +981,51 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
         b, _, dim_head = q.shape
         dim_head //= heads
 
-    # Try mps-flash-attn package first (battle-tested Metal kernels)
+    global _MFA_NATIVE_BRIDGE_RUNTIME_ENABLED
+    if _MFA_NATIVE_BRIDGE_AVAILABLE and _MFA_NATIVE_BRIDGE_RUNTIME_ENABLED:
+        logger.debug("[MPS ATTN] route=native_mfa_bridge n_kv=%d heads=%d dim_head=%d", n_kv, heads, dim_head)
+        try:
+            if skip_reshape:
+                q_4d, k_4d, v_4d = q, k, v
+            else:
+                q_4d = q.view(b, -1, heads, dim_head).transpose(1, 2)
+                k_4d = k.view(b, -1, heads, dim_head).transpose(1, 2)
+                v_4d = v.view(b, -1, heads, dim_head).transpose(1, 2)
+
+            q_4d = q_4d.contiguous()
+            k_4d = k_4d.contiguous()
+            v_4d = v_4d.contiguous()
+
+            attn_mask = mask
+            if attn_mask is not None:
+                # Native bridge bool mask semantics follow Metal kernels:
+                # True means masked, opposite of ComfyUI/PyTorch bool masks.
+                if attn_mask.dtype == torch.bool:
+                    attn_mask = ~attn_mask
+                if attn_mask.ndim == 2:
+                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+                elif attn_mask.ndim == 3:
+                    attn_mask = attn_mask.unsqueeze(1)
+
+            scale = float(dim_head ** -0.5)
+            out = _mfa_native.metal_scaled_dot_product_attention(
+                q_4d, k_4d, v_4d, attn_mask, 0.0, False, scale, False
+            )
+            if skip_output_reshape:
+                return out
+            return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+        except Exception as e:
+            logging.warning("Native MFABridge backend failed (%s), trying next backend", e)
+            if _MFA_NATIVE_BRIDGE_DISABLE_ON_ERROR:
+                _MFA_NATIVE_BRIDGE_RUNTIME_ENABLED = False
+                logging.warning(
+                    "Native MFABridge backend disabled for this process after first failure; "
+                    "using fallback backends for stability. Set COMFY_MPS_NATIVE_BRIDGE_DISABLE_ON_ERROR=0 to keep retrying."
+                )
+
+    # Try external package only when explicitly enabled via env.
     if _MFA_PACKAGE_AVAILABLE:
+        logger.debug("[MPS ATTN] route=external_mps_flash_attn n_kv=%d heads=%d dim_head=%d", n_kv, heads, dim_head)
         try:
             if skip_reshape:
                 q_4d, k_4d, v_4d = q, k, v
@@ -830,8 +1047,12 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
                 elif attn_mask.ndim == 3:
                     attn_mask = attn_mask.unsqueeze(1)
 
-            if n_kv > 65536:
-                out = _mfa.flash_attention_chunked(q_4d, k_4d, v_4d, chunk_size=16384)
+            if n_kv > chunk_threshold:
+                logger.debug(
+                    "[MPS ATTN] external chunked path n_kv=%d chunk_threshold=%d chunk_size=%d",
+                    n_kv, chunk_threshold, _MPS_FA_CHUNK_SIZE,
+                )
+                out = _mfa.flash_attention_chunked(q_4d, k_4d, v_4d, chunk_size=_MPS_FA_CHUNK_SIZE)
             else:
                 out = _mfa.flash_attention(q_4d, k_4d, v_4d, attn_mask=attn_mask)
 
@@ -842,9 +1063,13 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
         except Exception as e:
             logging.warning("mps_flash_attn failed (%s), trying custom Metal FA", e)
 
+    else:
+        logger.debug("[MPS ATTN] route=custom_metal_fa reason=external_not_enabled_or_unavailable n_kv=%d", n_kv)
+
     # Fall back to custom Metal FA kernel (simdgroup_matrix, works on macOS 26)
     try:
         from comfy.ldm.modules.metal_attention import metal_flash_attention
+        logger.debug("[MPS ATTN] route=custom_metal_fa n_kv=%d heads=%d dim_head=%d", n_kv, heads, dim_head)
         return metal_flash_attention(q, k, v, heads, mask=mask, attn_precision=attn_precision,
                                      skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
     except Exception as e:
@@ -856,10 +1081,27 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
 optimized_attention = attention_basic
 
 if model_management.metal_flash_attention_enabled():
-    if _MFA_PACKAGE_AVAILABLE:
-        logging.info("Using Metal Flash Attention (sub-quad for <=32K, mps-flash-attn for >32K)")
+    if _MFA_NATIVE_BRIDGE_AVAILABLE:
+        logging.info(
+            "Using Metal Flash Attention (sub-quad <=%d, native MFABridge >%d)",
+            _MPS_FA_BASE_THRESHOLD, _MPS_FA_BASE_THRESHOLD,
+        )
+    elif _MFA_PACKAGE_AVAILABLE:
+        logging.info(
+            "Using Metal Flash Attention (sub-quad <=%d, external mps-flash-attn >%d; chunk>%d size=%d)",
+            _MPS_FA_BASE_THRESHOLD, _MPS_FA_BASE_THRESHOLD,
+            _MPS_FA_BASE_CHUNK_THRESHOLD, _MPS_FA_CHUNK_SIZE,
+        )
     else:
-        logging.info("Using Metal Flash Attention (sub-quad for <=32K, custom Metal FA for >32K)")
+        logging.info(
+            "Using Metal Flash Attention (sub-quad <=%d, custom Metal FA >%d)",
+            _MPS_FA_BASE_THRESHOLD, _MPS_FA_BASE_THRESHOLD,
+        )
+    if _MPS_FA_PRESSURE_ROUTING:
+        logging.info(
+            "MPS pressure-aware routing enabled (fa<=%d, chunk>%d under pressure)",
+            _MPS_FA_PRESSURE_THRESHOLD, _MPS_FA_PRESSURE_CHUNK_THRESHOLD,
+        )
     optimized_attention = attention_metal_flash
 elif model_management.sage_attention_enabled():
     logging.info("Using sage attention")
@@ -1334,5 +1576,3 @@ class SpatialVideoTransformer(SpatialTransformer):
             x = self.proj_out(x)
         out = x + x_in
         return out
-
-
