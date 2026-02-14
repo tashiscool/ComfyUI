@@ -116,9 +116,11 @@ def _patch_memory_reporting():
     # get_free_memory() stays too small after Patch D and we never have "enough" free.
     # Use ~0.95 of recommended_max so we report a usable budget (e.g. 35–37 GB on
     # 48 GB Mac); Patch D unloads CPU models, then we have room for 14B + activations.
-    # Testing 44 GB: keeps models loaded, avoids unnecessary unload/reload cycles.
-    # OS + Python need ~4 GB headroom. MPS GC active (watermark ratio 1.7).
-    effective_max = int(44 * (1024**3))  # was: int(recommended_max * 0.95)
+    # 40 GB budget: leaves ~8 GB for macOS + apps. At 44 GB the system beachballs
+    # on every app switch during Wan 2.2 14B generation (peak 43.8 GB observed).
+    # 40 GB is enough for 14B FP8 + activations; may trigger more model offloading
+    # but prevents the OS from thrashing.
+    effective_max = int(40 * (1024**3))
 
     # Verify phys_footprint works at startup
     test_footprint = _get_phys_footprint()

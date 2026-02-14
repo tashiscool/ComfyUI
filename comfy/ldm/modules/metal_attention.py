@@ -290,6 +290,8 @@ def _get_lib_v2(head_dim, dtype, cache_q=False):
 
 def _can_use_metal_fa(q, mask):
     """Check if Metal Flash Attention can handle this call."""
+    if not METAL_FLASH_ATTENTION_ENABLED:
+        return False
     if q.device.type != 'mps':
         return False
     if mask is not None:
@@ -326,14 +328,14 @@ _SDPA_MAX_BYTES = 2147483648
 _compiled_libs_v3 = {}
 
 
-def _generate_v3_source(head_dim, bk=64, num_simd=4, half_s=False, device_v=False):
+def _generate_v3_source(head_dim, bk=64, num_simd=4, half_s=False, device_v=False, hd_block=0):
     """Generate Metal Flash Attention v3 kernel source.
 
     Hybrid architecture combining v1's threadgroup staging with v2's
     block-level softmax and exp2. Best of both worlds:
     - Cooperative K/V load into threadgroup (shared, no redundant bandwidth)
     - Block-level online softmax with exp2 (single-cycle instruction)
-    - Q cached in registers
+    - Q cached in registers (or reloaded per head block when hd_block > 0)
     - Configurable BK and SIMD groups
 
     Args:
@@ -343,6 +345,10 @@ def _generate_v3_source(head_dim, bk=64, num_simd=4, half_s=False, device_v=Fals
         device_v: If True, only K goes to threadgroup (V loaded from device).
                   Halves threadgroup memory, enabling BK up to 128 for HD=128.
                   V loads are non-transposed (coalesced) but redundant per SIMD.
+        hd_block: Head-dim tiling block size. 0 = cache all Q tiles in registers
+                  (current behavior). 32 = reload Q per head block of 32, reducing
+                  register pressure from 16 to 4 Q tiles. MFA uses 32 for HD>96
+                  on M4 to improve occupancy.
     """
     hd_tiles = head_dim // 8
     bk_tiles = bk // 8
@@ -355,6 +361,62 @@ def _generate_v3_source(head_dim, bk=64, num_simd=4, half_s=False, device_v=Fals
     NS = str(num_simd)
     BQT = str(bq_total)
     TPT = str(threads_per_tg)
+
+    # Build Q init and Phase 1 code based on head-dim tiling
+    if hd_block > 0:
+        num_hb = head_dim // hd_block
+        tiles_per_hb = hd_block // 8
+        NHB = str(num_hb)
+        TPHB = str(tiles_per_hb)
+        HDB = str(hd_block)
+        q_init_code = '    // Head-dim tiled: Q reloaded per block of ' + HDB + ' in Phase 1\n'
+        phase1_code = (
+            '        for (uint hb = 0; hb < ' + NHB + '; hb++) {\n'
+            '            uint d_offset = hb * ' + HDB + ';\n'
+            '            simdgroup_half8x8 q_tiles[' + TPHB + '];\n'
+            '            if (q_start + 8 <= N_q) {\n'
+            '                for (uint d = 0; d < ' + TPHB + '; d++)\n'
+            '                    simdgroup_load(q_tiles[d], Q_bh + (uint64_t)q_start * HD + d_offset + d * 8, HD);\n'
+            '            } else if (q_start < N_q) {\n'
+            '                for (uint d = 0; d < ' + TPHB + '; d++)\n'
+            '                    simdgroup_load(q_tiles[d], Q_bh + (uint64_t)min(q_start, N_q - 1) * HD + d_offset + d * 8, HD);\n'
+            '            } else {\n'
+            '                for (uint d = 0; d < ' + TPHB + '; d++)\n'
+            '                    q_tiles[d] = simdgroup_half8x8(0);\n'
+            '            }\n'
+            '            for (uint bk_t = 0; bk_t < bk_tiles; bk_t++) {\n'
+            '                for (uint d = 0; d < ' + TPHB + '; d++) {\n'
+            '                    simdgroup_half8x8 k_tile;\n'
+            '                    simdgroup_load(k_tile, k_s + bk_t * 8 * HD + d_offset + d * 8, HD, ulong2(0,0), true);\n'
+            '                    simdgroup_multiply_accumulate(s_acc[bk_t], q_tiles[d], k_tile, s_acc[bk_t]);\n'
+            '                }\n'
+            '            }\n'
+            '        }\n'
+        )
+    else:
+        q_init_code = (
+            '    // Cache Q tiles in registers\n'
+            '    simdgroup_half8x8 q_cached[' + HDT + '];\n'
+            '    if (q_start + 8 <= N_q) {\n'
+            '        for (uint t = 0; t < ' + HDT + '; t++)\n'
+            '            simdgroup_load(q_cached[t], Q_bh + (uint64_t)q_start * HD + t * 8, HD);\n'
+            '    } else if (q_start < N_q) {\n'
+            '        for (uint t = 0; t < ' + HDT + '; t++)\n'
+            '            simdgroup_load(q_cached[t], Q_bh + (uint64_t)min(q_start, N_q - 1) * HD + t * 8, HD);\n'
+            '    } else {\n'
+            '        for (uint t = 0; t < ' + HDT + '; t++)\n'
+            '            q_cached[t] = simdgroup_half8x8(0);\n'
+            '    }\n'
+        )
+        phase1_code = (
+            '        for (uint bk_t = 0; bk_t < bk_tiles; bk_t++) {\n'
+            '            for (uint hd_t = 0; hd_t < ' + HDT + '; hd_t++) {\n'
+            '                simdgroup_half8x8 k_tile;\n'
+            '                simdgroup_load(k_tile, k_s + bk_t * 8 * HD + hd_t * 8, HD, ulong2(0,0), true);\n'
+            '                simdgroup_multiply_accumulate(s_acc[bk_t], q_cached[hd_t], k_tile, s_acc[bk_t]);\n'
+            '            }\n'
+            '        }\n'
+        )
 
     source = (
         '#include <metal_stdlib>\n'
@@ -417,18 +479,7 @@ def _generate_v3_source(head_dim, bk=64, num_simd=4, half_s=False, device_v=Fals
         '    float row_sum = 0.0f;\n'
         '    float log2e_scale = LOG2E_CONST * scale;\n'
         '\n'
-        '    // Cache Q tiles in registers\n'
-        '    simdgroup_half8x8 q_cached[' + HDT + '];\n'
-        '    if (q_start + 8 <= N_q) {\n'
-        '        for (uint t = 0; t < ' + HDT + '; t++)\n'
-        '            simdgroup_load(q_cached[t], Q_bh + (uint64_t)q_start * HD + t * 8, HD);\n'
-        '    } else if (q_start < N_q) {\n'
-        '        for (uint t = 0; t < ' + HDT + '; t++)\n'
-        '            simdgroup_load(q_cached[t], Q_bh + (uint64_t)min(q_start, N_q - 1) * HD + t * 8, HD);\n'
-        '    } else {\n'
-        '        for (uint t = 0; t < ' + HDT + '; t++)\n'
-        '            q_cached[t] = simdgroup_half8x8(0);\n'
-        '    }\n'
+        + q_init_code +
         '\n'
         '    // === KV outer loop: BK=' + BK + ' blocks, threadgroup staging, block softmax ===\n'
         '    for (uint kv_start = 0; kv_start < N_kv; kv_start += BK) {\n'
@@ -479,13 +530,7 @@ def _generate_v3_source(head_dim, bk=64, num_simd=4, half_s=False, device_v=Fals
            '        for (uint i = 0; i < ' + BKT + '; i++) s_acc[i] = simdgroup_float8x8(0.0f);\n'
           ) +
         '\n'
-        '        for (uint bk_t = 0; bk_t < bk_tiles; bk_t++) {\n'
-        '            for (uint hd_t = 0; hd_t < ' + HDT + '; hd_t++) {\n'
-        '                simdgroup_half8x8 k_tile;\n'
-        '                simdgroup_load(k_tile, k_s + bk_t * 8 * HD + hd_t * 8, HD, ulong2(0,0), true);\n'
-        '                simdgroup_multiply_accumulate(s_acc[bk_t], q_cached[hd_t], k_tile, s_acc[bk_t]);\n'
-        '            }\n'
-        '        }\n'
+        + phase1_code +
         '\n'
         '        // --- Phase 2: Block-level online softmax with exp2 ---\n'
         '        float block_max = -INFINITY;\n'
@@ -789,21 +834,28 @@ def _dispatch_v4(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, dtype, bk=32, num_simd=
     return out
 
 
-def _get_lib_v3(head_dim, dtype, bk=64, num_simd=4, half_s=False, device_v=False):
+def _get_lib_v3(head_dim, dtype, bk=64, num_simd=4, half_s=False, device_v=False, hd_block=0):
     """Get or compile the Metal flash attention v3 shader library."""
-    key = (head_dim, dtype, bk, num_simd, half_s, device_v)
+    if hd_block != 0:
+        if hd_block < 8 or hd_block % 8 != 0:
+            raise ValueError(f'hd_block must be 0 or divisible by 8 (>=8), got {hd_block}')
+        if hd_block > head_dim or head_dim % hd_block != 0:
+            raise ValueError(f'hd_block must divide head_dim and be <= head_dim, got hd_block={hd_block}, head_dim={head_dim}')
+
+    key = (head_dim, dtype, bk, num_simd, half_s, device_v, hd_block)
     if key not in _compiled_libs_v3:
         if head_dim % 8 != 0:
             raise ValueError(f'head_dim must be divisible by 8, got {head_dim}')
-        source = _generate_v3_source(head_dim, bk, num_simd, half_s, device_v)
+        source = _generate_v3_source(head_dim, bk, num_simd, half_s, device_v, hd_block)
         _compiled_libs_v3[key] = torch.mps.compile_shader(source)
         threads = num_simd * 32
         s_type = 'FP16' if half_s else 'FP32'
         v_src = 'device' if device_v else 'threadgroup'
+        hd_str = f', HD_BLOCK={hd_block}' if hd_block > 0 else ''
         logger.info(
             f'Compiled Metal Flash Attention v3: HD={head_dim}'
             f', BK={bk}, {num_simd} SIMD groups ({threads} threads/tg)'
-            f', S_acc={s_type}, V={v_src}')
+            f', S_acc={s_type}, V={v_src}{hd_str}')
     return _compiled_libs_v3[key]
 
 
@@ -872,7 +924,30 @@ def _dispatch_v2(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, dtype, cache_q=False):
     return out
 
 
-def _dispatch_v3(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, dtype, bk=32, num_simd=4, half_s=False, device_v=True):
+# ============================================================
+# Kernel parameter table (HD-specific, validated on M4 Pro)
+# ============================================================
+
+# Each entry: (bk, num_simd, device_v, hd_block)
+# Validated via benchmark sweep: BK=[16-128], SIMD=[2,4,6,8], device_v=[T/F], hd_block=[0,32,64]
+_V3_PARAM_TABLE = {
+    # HD : (bk, num_simd, device_v, hd_block)
+    32:  (32, 4, True, 0),   # Small HD: BK=32 optimal, Q cached
+    64:  (32, 4, True, 0),   # Medium HD: same optimal config
+    96:  (32, 4, True, 0),   # BK=32, full Q caching
+    128: (32, 4, True, 0),   # Wan 2.2 default: 2.2 TFLOPS on M4 Pro
+    256: (32, 4, True, 0),   # Large HD: BK=32 still optimal (threadgroup = 16KB)
+}
+
+def _get_v3_params(dim_head):
+    """Look up optimal v3 kernel parameters for a given head dimension."""
+    if dim_head in _V3_PARAM_TABLE:
+        return _V3_PARAM_TABLE[dim_head]
+    # Fallback: conservative defaults for unknown HD
+    return (32, 4, True, 0)
+
+
+def _dispatch_v3(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, dtype, bk=32, num_simd=4, half_s=False, device_v=True, hd_block=0):
     """Dispatch Metal Flash Attention v3 kernel (hybrid)."""
     bq_total = 8 * num_simd
     threads_per_tg = num_simd * 32
@@ -883,7 +958,7 @@ def _dispatch_v3(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, dtype, bk=32, num_simd=
     n_q_padded = q_c.shape[1]
 
     out = torch.empty_like(q_c)
-    lib = _get_lib_v3(dim_head, dtype, bk, num_simd, half_s, device_v)
+    lib = _get_lib_v3(dim_head, dtype, bk, num_simd, half_s, device_v, hd_block)
     scale = 1.0 / math.sqrt(dim_head)
     num_q_blocks = n_q_padded // bq_total
 
@@ -927,11 +1002,15 @@ def metal_flash_attention(q, k, v, heads, mask=None, attn_precision=None, skip_r
         dim_head //= heads
 
     if not _can_use_metal_fa(q, mask) or dim_head % 8 != 0 or dim_head > 256:
+        reason = 'disabled' if not METAL_FLASH_ATTENTION_ENABLED else 'non-MPS' if q.device.type != 'mps' else 'mask' if mask is not None else f'HD={dim_head}'
+        logger.debug(f'Metal FA fallback to SDPA: {reason}')
         return _fallback_sdpa(q, k, v, heads, b, dim_head, skip_reshape, skip_output_reshape)
 
     n_q = q.shape[2] if skip_reshape else q.shape[1]
     n_kv = k.shape[2] if skip_reshape else k.shape[1]
-    if _estimate_sdpa_attn_bytes(heads, n_q, n_kv) < _SDPA_MAX_BYTES:
+    attn_bytes = _estimate_sdpa_attn_bytes(heads, n_q, n_kv)
+    if attn_bytes < _SDPA_MAX_BYTES:
+        logger.debug(f'Metal FA routing to SDPA: attn_bytes={attn_bytes/1e9:.2f}GB < 2GB threshold, N_q={n_q}, N_kv={n_kv}, H={heads}')
         return _fallback_sdpa(q, k, v, heads, b, dim_head, skip_reshape, skip_output_reshape)
 
     # Reshape to (B*H, N, dim_head) for the Metal kernel
@@ -948,12 +1027,21 @@ def metal_flash_attention(q, k, v, heads, mask=None, attn_precision=None, skip_r
 
     # Select kernel version
     ver = METAL_FA_VERSION
+    logger.debug(f'Metal FA dispatch: ver={ver}, N_q={n_q}, N_kv={n_kv}, BH={BH}, HD={dim_head}, attn={attn_bytes/1e9:.1f}GB')
     if ver == 'v3':
-        out = _dispatch_v3(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, q.dtype)
-    elif ver.startswith('v2') and dim_head % 32 == 0:
-        cache_q = (ver == 'v2b')
-        out = _dispatch_v2(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, q.dtype, cache_q)
+        bk, ns, dv, hdb = _get_v3_params(dim_head)
+        out = _dispatch_v3(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, q.dtype, bk=bk, num_simd=ns, device_v=dv, hd_block=hdb)
+    elif ver == 'v4':
+        out = _dispatch_v4(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, q.dtype)
+    elif ver.startswith('v2'):
+        if dim_head % 32 == 0:
+            cache_q = (ver == 'v2b')
+            out = _dispatch_v2(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, q.dtype, cache_q)
+        else:
+            logger.debug(f'Metal FA fallback to v1: ver={ver} requires dim_head % 32 == 0, got {dim_head}')
+            out = _dispatch_v1(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, q.dtype)
     else:
+        logger.debug(f'Metal FA fallback to v1: unknown METAL_FA_VERSION={ver}')
         out = _dispatch_v1(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, q.dtype)
 
     if skip_output_reshape:
@@ -963,6 +1051,7 @@ def metal_flash_attention(q, k, v, heads, mask=None, attn_precision=None, skip_r
 
 
 METAL_FLASH_ATTENTION_AVAILABLE = False
+METAL_FLASH_ATTENTION_ENABLED = True  # Runtime toggle: set False to force SDPA fallback
 try:
     if hasattr(torch, 'mps') and hasattr(torch.mps, 'compile_shader'):
         if torch.backends.mps.is_available():
