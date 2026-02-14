@@ -574,6 +574,221 @@ def _generate_v3_source(head_dim, bk=64, num_simd=4, half_s=False, device_v=Fals
     return source
 
 
+# ============================================================
+# v4 kernel (zero-threadgroup: pre-transposed K + device V)
+# ============================================================
+
+_compiled_libs_v4 = {}
+
+
+def _generate_v4_source(head_dim, bk=32, num_simd=4):
+    """Generate Metal Flash Attention v4 kernel source.
+
+    Fully device-resident: NO threadgroup memory, NO barriers.
+    K is pre-transposed in Python to (BH, HD, N_kv) layout so device loads
+    are coalesced. V loaded directly from device (non-transposed).
+    """
+    hd_tiles = head_dim // 8
+    bk_tiles = bk // 8
+    bq_total = 8 * num_simd
+    threads_per_tg = num_simd * 32
+    HDT = str(hd_tiles)
+    BKT = str(bk_tiles)
+    HD = str(head_dim)
+    BK = str(bk)
+
+    source = (
+        '#include <metal_stdlib>\n'
+        '#include <metal_simdgroup_matrix>\n'
+        'using namespace metal;\n'
+        '\n'
+        'constant uint BQ = 8;\n'
+        'constant uint BK = ' + BK + ';\n'
+        'constant uint HD = ' + HD + ';\n'
+        'constant uint HD_TILES = ' + HDT + ';\n'
+        'constant uint BK_TILES = ' + BKT + ';\n'
+        'constant float LOG2E_CONST = 1.442695041f;\n'
+        '\n'
+        '// v4: K_t is pre-transposed to (BH, HD, N_kv) layout.\n'
+        '// Loads are non-transposed and coalesced from device memory.\n'
+        '// ZERO threadgroup memory, ZERO barriers.\n'
+        'kernel void flash_attention_v4_fwd(\n'
+        '    device const half* Q [[buffer(0)]],\n'
+        '    device const half* K_t [[buffer(1)]],\n'  # pre-transposed K
+        '    device const half* V [[buffer(2)]],\n'
+        '    device half* O [[buffer(3)]],\n'
+        '    constant uint& N_q [[buffer(4)]],\n'
+        '    constant uint& N_kv [[buffer(5)]],\n'
+        '    constant uint& batch_heads [[buffer(6)]],\n'
+        '    constant float& scale [[buffer(7)]],\n'
+        '    constant uint& N_q_padded [[buffer(8)]],\n'
+        '    uint2 tgid [[threadgroup_position_in_grid]],\n'
+        '    uint simd_lane [[thread_index_in_simdgroup]],\n'
+        '    uint simd_idx [[simdgroup_index_in_threadgroup]]\n'
+        ') {\n'
+        '    uint bh = tgid.y;\n'
+        '    if (bh >= batch_heads) return;\n'
+        '\n'
+        '    uint q_start = tgid.x * ' + str(bq_total) + ' + simd_idx * BQ;\n'
+        '\n'
+        '    device const half* Q_bh = Q + (uint64_t)bh * N_q_padded * HD;\n'
+        '    // K_t layout: (BH, HD, N_kv) — row d, col kv_pos\n'
+        '    device const half* Kt_bh = K_t + (uint64_t)bh * HD * N_kv;\n'
+        '    device const half* V_bh = V + (uint64_t)bh * N_kv * HD;\n'
+        '    device half* O_bh = O + (uint64_t)bh * N_q_padded * HD;\n'
+        '\n'
+        '    uint qid = simd_lane / 4;\n'
+        '    uint my_row0 = (qid & 4u) + ((simd_lane / 2u) % 4u);\n'
+        '    uint my_col0 = (qid & 2u) * 2u + (simd_lane % 2u) * 2u;\n'
+        '\n'
+        '    simdgroup_float8x8 o_acc[' + HDT + '];\n'
+        '    for (uint t = 0; t < ' + HDT + '; t++) o_acc[t] = simdgroup_float8x8(0.0f);\n'
+        '\n'
+        '    float row_max = -INFINITY;\n'
+        '    float row_sum = 0.0f;\n'
+        '    float log2e_scale = LOG2E_CONST * scale;\n'
+        '\n'
+        '    // Cache Q tiles in registers\n'
+        '    simdgroup_half8x8 q_cached[' + HDT + '];\n'
+        '    if (q_start + 8 <= N_q) {\n'
+        '        for (uint t = 0; t < ' + HDT + '; t++)\n'
+        '            simdgroup_load(q_cached[t], Q_bh + (uint64_t)q_start * HD + t * 8, HD);\n'
+        '    } else if (q_start < N_q) {\n'
+        '        for (uint t = 0; t < ' + HDT + '; t++)\n'
+        '            simdgroup_load(q_cached[t], Q_bh + (uint64_t)min(q_start, N_q - 1) * HD + t * 8, HD);\n'
+        '    } else {\n'
+        '        for (uint t = 0; t < ' + HDT + '; t++)\n'
+        '            q_cached[t] = simdgroup_half8x8(0);\n'
+        '    }\n'
+        '\n'
+        '    // === KV outer loop: NO threadgroup memory, NO barriers ===\n'
+        '    for (uint kv_start = 0; kv_start < N_kv; kv_start += BK) {\n'
+        '        uint bk_tiles = min(BK_TILES, (N_kv - kv_start + 7) / 8);\n'
+        '\n'
+        '        // --- Phase 1: S = Q_cached * K^T (direct device loads, coalesced) ---\n'
+        '        simdgroup_float8x8 s_acc[' + BKT + '];\n'
+        '        for (uint i = 0; i < ' + BKT + '; i++) s_acc[i] = simdgroup_float8x8(0.0f);\n'
+        '\n'
+        '        for (uint bk_t = 0; bk_t < bk_tiles; bk_t++) {\n'
+        '            for (uint hd_t = 0; hd_t < ' + HDT + '; hd_t++) {\n'
+        '                simdgroup_half8x8 k_tile;\n'
+        '                // K_t layout: (HD, N_kv), load 8x8 at (hd_t*8, kv_start+bk_t*8)\n'
+        '                // stride = N_kv, non-transposed, coalesced device load\n'
+        '                simdgroup_load(k_tile, Kt_bh + (uint64_t)(hd_t * 8) * N_kv + kv_start + bk_t * 8, N_kv);\n'
+        '                simdgroup_multiply_accumulate(s_acc[bk_t], q_cached[hd_t], k_tile, s_acc[bk_t]);\n'
+        '            }\n'
+        '        }\n'
+        '\n'
+        '        // --- Phase 2: Block-level online softmax with exp2 ---\n'
+        '        float block_max = -INFINITY;\n'
+        '        for (uint bk_t = 0; bk_t < bk_tiles; bk_t++) {\n'
+        '            float s0 = s_acc[bk_t].thread_elements()[0] * log2e_scale;\n'
+        '            float s1 = s_acc[bk_t].thread_elements()[1] * log2e_scale;\n'
+        '\n'
+        '            uint kv_col0 = kv_start + bk_t * 8 + my_col0;\n'
+        '            if (kv_col0 >= N_kv) s0 = -INFINITY;\n'
+        '            if (kv_col0 + 1 >= N_kv) s1 = -INFINITY;\n'
+        '            if (q_start + my_row0 >= N_q) { s0 = -INFINITY; s1 = -INFINITY; }\n'
+        '\n'
+        '            s_acc[bk_t].thread_elements()[0] = s0;\n'
+        '            s_acc[bk_t].thread_elements()[1] = s1;\n'
+        '            block_max = max(block_max, max(s0, s1));\n'
+        '        }\n'
+        '        block_max = max(block_max, simd_shuffle_xor(block_max, 1));\n'
+        '        block_max = max(block_max, simd_shuffle_xor(block_max, 8));\n'
+        '\n'
+        '        float new_max = max(row_max, block_max);\n'
+        '        float alpha = (new_max == -INFINITY) ? 0.0f : fast::exp2(row_max - new_max);\n'
+        '        for (uint t = 0; t < ' + HDT + '; t++) {\n'
+        '            o_acc[t].thread_elements()[0] *= alpha;\n'
+        '            o_acc[t].thread_elements()[1] *= alpha;\n'
+        '        }\n'
+        '        row_sum *= alpha;\n'
+        '        row_max = new_max;\n'
+        '\n'
+        '        // --- Phase 3: Fused P computation + P*V accumulation ---\n'
+        '        float block_sum = 0.0f;\n'
+        '        for (uint bk_t = 0; bk_t < bk_tiles; bk_t++) {\n'
+        '            float p0 = fast::exp2(s_acc[bk_t].thread_elements()[0] - new_max);\n'
+        '            float p1 = fast::exp2(s_acc[bk_t].thread_elements()[1] - new_max);\n'
+        '            block_sum += p0 + p1;\n'
+        '\n'
+        '            simdgroup_half8x8 p_tile;\n'
+        '            p_tile.thread_elements()[0] = half(p0);\n'
+        '            p_tile.thread_elements()[1] = half(p1);\n'
+        '\n'
+        '            for (uint hd_t = 0; hd_t < ' + HDT + '; hd_t++) {\n'
+        '                simdgroup_half8x8 v_tile;\n'
+        '                simdgroup_load(v_tile, V_bh + (uint64_t)(kv_start + bk_t * 8) * HD + hd_t * 8, HD);\n'
+        '                simdgroup_multiply_accumulate(o_acc[hd_t], p_tile, v_tile, o_acc[hd_t]);\n'
+        '            }\n'
+        '        }\n'
+        '        block_sum += simd_shuffle_xor(block_sum, 1);\n'
+        '        block_sum += simd_shuffle_xor(block_sum, 8);\n'
+        '        row_sum += block_sum;\n'
+        '    }\n'
+        '\n'
+        '    // Normalize and write output\n'
+        '    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;\n'
+        '    for (uint t = 0; t < ' + HDT + '; t++) {\n'
+        '        simdgroup_half8x8 out_tile;\n'
+        '        out_tile.thread_elements()[0] = half(o_acc[t].thread_elements()[0] * inv_sum);\n'
+        '        out_tile.thread_elements()[1] = half(o_acc[t].thread_elements()[1] * inv_sum);\n'
+        '        simdgroup_store(out_tile, O_bh + (uint64_t)q_start * HD + t * 8, HD);\n'
+        '    }\n'
+        '}\n'
+    )
+    return source
+
+
+def _get_lib_v4(head_dim, dtype, bk=32, num_simd=4):
+    """Get or compile the Metal flash attention v4 shader library."""
+    key = (head_dim, dtype, bk, num_simd)
+    if key not in _compiled_libs_v4:
+        if head_dim % 8 != 0:
+            raise ValueError(f'head_dim must be divisible by 8, got {head_dim}')
+        source = _generate_v4_source(head_dim, bk, num_simd)
+        _compiled_libs_v4[key] = torch.mps.compile_shader(source)
+        threads = num_simd * 32
+        logger.info(
+            f'Compiled Metal Flash Attention v4: HD={head_dim}'
+            f', BK={bk}, {num_simd} SIMD groups ({threads} threads/tg)'
+            f', zero-threadgroup (pre-transposed K)')
+    return _compiled_libs_v4[key]
+
+
+def _dispatch_v4(q_c, k_c, v_c, n_q, n_kv, BH, dim_head, dtype, bk=32, num_simd=4):
+    """Dispatch Metal Flash Attention v4 kernel (zero-threadgroup).
+
+    Pre-transposes K to (BH, HD, N_kv) layout for coalesced device loads.
+    """
+    bq_total = 8 * num_simd
+    threads_per_tg = num_simd * 32
+
+    pad_q = (bq_total - n_q % bq_total) % bq_total
+    if pad_q > 0:
+        q_c = F.pad(q_c, (0, 0, 0, pad_q))
+    n_q_padded = q_c.shape[1]
+
+    # Pre-transpose K: (BH, N_kv, HD) → (BH, HD, N_kv)
+    k_t = k_c.transpose(-2, -1).contiguous()
+
+    out = torch.empty_like(q_c)
+    lib = _get_lib_v4(dim_head, dtype, bk, num_simd)
+    scale = 1.0 / math.sqrt(dim_head)
+    num_q_blocks = n_q_padded // bq_total
+
+    lib.flash_attention_v4_fwd(
+        q_c, k_t, v_c, out,
+        n_q, n_kv, BH, scale, n_q_padded,
+        threads=(num_q_blocks * threads_per_tg, BH),
+        group_size=(threads_per_tg, 1))
+
+    if pad_q > 0:
+        out = out[:, :n_q, :]
+    return out
+
+
 def _get_lib_v3(head_dim, dtype, bk=64, num_simd=4, half_s=False, device_v=False):
     """Get or compile the Metal flash attention v3 shader library."""
     key = (head_dim, dtype, bk, num_simd, half_s, device_v)
