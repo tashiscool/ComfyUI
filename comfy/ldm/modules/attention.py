@@ -58,6 +58,80 @@ _MFA_PACKAGE_AVAILABLE = False
 _mfa = None
 
 
+# ---------------------------------------------------------------------------
+# Backend routing metrics (counts + latency per backend/reason)
+# ---------------------------------------------------------------------------
+import time as _time
+import threading as _threading
+import atexit as _atexit
+import collections as _collections
+
+
+class _RoutingMetrics:
+    """Thread-safe backend routing metrics tracker."""
+
+    _SUMMARY_INTERVAL = 100  # log summary every N calls
+
+    def __init__(self):
+        self._lock = _threading.Lock()
+        self.counts = _collections.Counter()       # backend -> count
+        self.reasons = _collections.Counter()       # reason -> count
+        self.latencies = _collections.defaultdict(list)  # backend -> [ms]
+        self.total_calls = 0
+        self._enabled = _is_truthy_env_raw("COMFY_MPS_ATTN_METRICS", True)
+
+    def record(self, backend: str, reason: str, latency_ms: float):
+        if not self._enabled:
+            return
+        with self._lock:
+            self.counts[backend] += 1
+            self.reasons[reason] += 1
+            self.latencies[backend].append(latency_ms)
+            self.total_calls += 1
+            if self.total_calls % self._SUMMARY_INTERVAL == 0:
+                self._log_summary_locked()
+
+    def _log_summary_locked(self):
+        parts = []
+        for backend in sorted(self.counts):
+            c = self.counts[backend]
+            lats = self.latencies[backend]
+            if lats:
+                avg = sum(lats) / len(lats)
+                p50 = sorted(lats)[len(lats) // 2]
+                p95 = sorted(lats)[int(len(lats) * 0.95)]
+                parts.append(f"{backend}={c} (avg={avg:.1f}ms p50={p50:.1f}ms p95={p95:.1f}ms)")
+            else:
+                parts.append(f"{backend}={c}")
+        reasons_str = " ".join(f"{r}={n}" for r, n in self.reasons.most_common(5))
+        logger.info(
+            "[MPS ATTN METRICS] calls=%d | %s | top_reasons: %s",
+            self.total_calls, " | ".join(parts), reasons_str,
+        )
+
+    def log_final_summary(self):
+        if not self._enabled or self.total_calls == 0:
+            return
+        with self._lock:
+            self._log_summary_locked()
+            # Also log per-reason breakdown
+            logger.info(
+                "[MPS ATTN METRICS] final reason breakdown: %s",
+                " ".join(f"{r}={n}" for r, n in self.reasons.most_common()),
+            )
+
+
+def _is_truthy_env_raw(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_attn_metrics = _RoutingMetrics()
+_atexit.register(_attn_metrics.log_final_summary)
+
+
 def _is_truthy_env(name, default=False):
     raw = os.environ.get(name)
     if raw is None:
@@ -67,7 +141,7 @@ def _is_truthy_env(name, default=False):
 
 def _try_load_native_mfa_bridge():
     """Load native MFABridge PyTorch extension (Swift/ObjC++/C++ path)."""
-    if not _is_truthy_env("COMFY_MPS_NATIVE_BRIDGE_ENABLED", True):
+    if not _is_truthy_env("COMFY_MPS_NATIVE_BRIDGE_ENABLED", False):
         return None
 
     def _validate_module(mod):
@@ -945,10 +1019,14 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
 
     Thresholds are tunable through COMFY_MPS_FA_THRESHOLD and pressure-aware policy.
     """
+    _t0 = _time.monotonic()
+
     if not MPS_FLASH_ATTENTION_IS_AVAILABLE:
         logger.debug("[MPS ATTN] route=sub_quad reason=metal_flash_unavailable")
-        return attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
-                                  skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        out = attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                 skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        _attn_metrics.record("sub_quad", "metal_flash_unavailable", (_time.monotonic() - _t0) * 1000)
+        return out
 
     # Determine sequence length to pick the right backend
     n_kv = k.shape[2] if skip_reshape else k.shape[1]
@@ -971,8 +1049,10 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
             "[MPS ATTN] route=sub_quad reason=short_sequence n_kv=%d threshold=%d pressure=%s",
             n_kv, fa_threshold, under_pressure,
         )
-        return attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
-                                  skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        out = attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                 skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        _attn_metrics.record("sub_quad", "short_sequence", (_time.monotonic() - _t0) * 1000)
+        return out
 
     # Long sequences: need O(N) memory flash attention
     if skip_reshape:
@@ -1011,10 +1091,13 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
             out = _mfa_native.metal_scaled_dot_product_attention(
                 q_4d, k_4d, v_4d, attn_mask, 0.0, False, scale, False
             )
+            _lat = (_time.monotonic() - _t0) * 1000
+            _attn_metrics.record("native_bridge", "ok", _lat)
             if skip_output_reshape:
                 return out
             return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         except Exception as e:
+            _attn_metrics.record("native_bridge", f"error:{type(e).__name__}", (_time.monotonic() - _t0) * 1000)
             logging.warning("Native MFABridge backend failed (%s), trying next backend", e)
             if _MFA_NATIVE_BRIDGE_DISABLE_ON_ERROR:
                 _MFA_NATIVE_BRIDGE_RUNTIME_ENABLED = False
@@ -1022,6 +1105,7 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
                     "Native MFABridge backend disabled for this process after first failure; "
                     "using fallback backends for stability. Set COMFY_MPS_NATIVE_BRIDGE_DISABLE_ON_ERROR=0 to keep retrying."
                 )
+            _t0 = _time.monotonic()  # reset timer for fallback path
 
     # Try external package only when explicitly enabled via env.
     if _MFA_PACKAGE_AVAILABLE:
@@ -1053,15 +1137,20 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
                     n_kv, chunk_threshold, _MPS_FA_CHUNK_SIZE,
                 )
                 out = _mfa.flash_attention_chunked(q_4d, k_4d, v_4d, chunk_size=_MPS_FA_CHUNK_SIZE)
+                _backend_label = "external_mfa_chunked"
             else:
                 out = _mfa.flash_attention(q_4d, k_4d, v_4d, attn_mask=attn_mask)
+                _backend_label = "external_mfa"
 
+            _attn_metrics.record(_backend_label, "ok", (_time.monotonic() - _t0) * 1000)
             if skip_output_reshape:
                 return out
             else:
                 return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         except Exception as e:
+            _attn_metrics.record("external_mfa", f"error:{type(e).__name__}", (_time.monotonic() - _t0) * 1000)
             logging.warning("mps_flash_attn failed (%s), trying custom Metal FA", e)
+            _t0 = _time.monotonic()  # reset timer for fallback
 
     else:
         logger.debug("[MPS ATTN] route=custom_metal_fa reason=external_not_enabled_or_unavailable n_kv=%d", n_kv)
@@ -1070,12 +1159,18 @@ def attention_metal_flash(q, k, v, heads, mask=None, attn_precision=None, skip_r
     try:
         from comfy.ldm.modules.metal_attention import metal_flash_attention
         logger.debug("[MPS ATTN] route=custom_metal_fa n_kv=%d heads=%d dim_head=%d", n_kv, heads, dim_head)
-        return metal_flash_attention(q, k, v, heads, mask=mask, attn_precision=attn_precision,
-                                     skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        out = metal_flash_attention(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                    skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        _attn_metrics.record("custom_metal_fa", "ok", (_time.monotonic() - _t0) * 1000)
+        return out
     except Exception as e:
+        _attn_metrics.record("custom_metal_fa", f"error:{type(e).__name__}", (_time.monotonic() - _t0) * 1000)
         logging.warning("Custom Metal FA failed (%s), falling back to sub_quad", e)
-        return attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
-                                  skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        _t0 = _time.monotonic()
+        out = attention_sub_quad(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                 skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        _attn_metrics.record("sub_quad", "all_fa_failed", (_time.monotonic() - _t0) * 1000)
+        return out
 
 
 optimized_attention = attention_basic
